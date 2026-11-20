@@ -44,7 +44,7 @@ __description__ = (
     "окно реакций, теги каналов и бейджи ролей"
 )
 __author__ = "@c0rei5"
-__version__ = "1.5.17"
+__version__ = "1.5.18"
 __icon__ = "Forkplug/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.6"
@@ -119,6 +119,72 @@ ROLE_ALIASES = {
     "tester": "tester", "тестер": "tester", "тестировщик": "tester",
     "user": "user", "пользователь": "user",
 }
+# lambda glyph (replaces the text "λ" in update messages)
+LAMBDA_PNG_B64 = (
+    "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"
+    "fWVVAAAAAElFTkSuQmCC"
+)
+
 LIST_STYLES = ["Выкл", "Сдвиг у точки", "Масштаб у точки", "Сдвиг + масштаб", "Выбор: увеличение при скролле", "Выбор: увеличение всегда"]
 MENU_STYLES = ["Стандартная", "Масштаб", "Часы (маятник)", "Переворот 3D", "Растворение", "Покачивание"]
 
@@ -445,11 +511,39 @@ class ForkPlug(BasePlugin):
 
         run_on_queue(work)
 
+    def _with_lambda(self, activity, text: str, text_sp: float):
+        """Replace every text lambda in `text` with the lambda image. Falls back to plain text."""
+        try:
+            if "\u03bb" not in text:
+                return text
+            import base64
+            Base64 = jclass("android.util.Base64")
+            BitmapFactory = jclass("android.graphics.BitmapFactory")
+            BitmapDrawable = jclass("android.graphics.drawable.BitmapDrawable")
+            ImageSpan = jclass("android.text.style.ImageSpan")
+            raw = base64.b64decode(LAMBDA_PNG_B64)
+            bmp = BitmapFactory.decodeByteArray(raw, 0, len(raw))
+            if bmp is None:
+                return text
+            drawable = BitmapDrawable(activity.getResources(), bmp)
+            h = int(dp(text_sp * 1.25))
+            w = int(h * float(bmp.getWidth()) / float(bmp.getHeight()))
+            drawable.setBounds(0, 0, w, h)
+            sb = SpannableStringBuilder(text)
+            idx = text.find("\u03bb")
+            while idx >= 0:
+                sb.setSpan(ImageSpan(drawable, 1), idx, idx + 1, 33)
+                idx = text.find("\u03bb", idx + 1)
+            return sb
+        except Exception:
+            self.logger.exception("lambda span failed")
+            return text
+
     def _update_dialog(self, new_v: str, url: str, notes: str):
         try:
             activity = get_last_fragment().getParentActivity()
             tv = TextView(activity)
-            tv.setText("Версия %s (у вас %s)\n\n%s" % (new_v, __version__, notes or "Список изменений не указан"))
+            tv.setText(self._with_lambda(activity, "Версия %s (у вас %s)\n\n%s" % (new_v, __version__, notes or "Список изменений не указан"), 15.0))
             tv.setTextSize(15.0)
             tv.setPadding(int(dp(22)), int(dp(8)), int(dp(22)), int(dp(8)))
             sv = ScrollView(activity)
