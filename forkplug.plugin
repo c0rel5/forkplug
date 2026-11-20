@@ -44,7 +44,7 @@ __description__ = (
     "окно реакций, теги каналов и бейджи ролей"
 )
 __author__ = "@c0rei5"
-__version__ = "1.5.19"
+__version__ = "1.5.20"
 __icon__ = "Forkplug/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.6"
@@ -716,7 +716,7 @@ class ForkPlug(BasePlugin):
 
             Divider(),
             Text(text="Диагностика хуков", on_click=self._show_diag),
-            Text(text="forkplug " + __version__),
+            Text(text="forkplug " + __version__, on_click=self._on_version_tap),
         ]
 
     # ------------------------------------------------------------- updates
@@ -794,6 +794,60 @@ class ForkPlug(BasePlugin):
         except Exception:
             self.logger.exception("lambda span failed")
             return text
+
+    # ------------------------------------------------------------ about (easter egg)
+    ABOUT_QUOTE = "У профессионалов есть правила: будь вежлив, работай эффективно, убивай каждого встречного."
+
+    def _on_version_tap(self, *a):
+        try:
+            now = time.time()
+            if now - getattr(self, "_tap_t", 0.0) > 1.5:
+                self._taps = 0
+            self._tap_t = now
+            self._taps = getattr(self, "_taps", 0) + 1
+            if self._taps >= 7:
+                self._taps = 0
+                self._about_dialog()
+        except Exception:
+            self.logger.exception("version tap failed")
+
+    def _about_dialog(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            Typeface = jclass("android.graphics.Typeface")
+            text_color = Theme.getColor(Theme.key_dialogTextBlack)
+            hint_color = Theme.getColor(Theme.key_dialogTextGray2)
+            root = LinearLayout(activity)
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(int(dp(22)), int(dp(8)), int(dp(22)), int(dp(8)))
+
+            def add(text, size, color, bold=False, italic=False, top=0):
+                t = TextView(activity)
+                t.setText(text)
+                t.setTextSize(size)
+                t.setTextColor(_jc(color))
+                if bold:
+                    t.setTypeface(Typeface.DEFAULT_BOLD)
+                elif italic:
+                    t.setTypeface(Typeface.DEFAULT, 2)
+                t.setPadding(0, int(dp(top)), 0, 0)
+                root.addView(t)
+
+            add("forkplug " + __version__, 20.0, text_color, bold=True)
+            add(__description__, 15.0, text_color, top=10)
+            add("Автор: " + __author__, 15.0, hint_color, top=14)
+            add("\u00ab" + self.ABOUT_QUOTE + "\u00bb", 15.0, text_color, italic=True, top=14)
+
+            sv = ScrollView(activity)
+            sv.addView(root)
+            b = AlertDialogBuilder(activity)
+            b.set_title("О плагине")
+            b.set_view(sv)
+            b.set_positive_button("Закрыть", lambda bb, w: bb.dismiss())
+            b.show()
+        except Exception:
+            self.logger.exception("about dialog failed")
 
     def _update_dialog(self, new_v: str, url: str, notes: str):
         try:
