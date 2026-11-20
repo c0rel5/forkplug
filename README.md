@@ -1,4 +1,8 @@
-# forkplug
+<p align="center">
+  <img src="logo.gif" width="160" alt="forkplug logo">
+</p>
+
+<h1 align="center">forkplug</h1>
 
 Плагин для [exteraGram](https://github.com/exteraSquad/exteraGram): аватары в упоминаниях, M3 Expressive индикаторы загрузки, окно реакций, анимации меню и бейджи ролей.
 
