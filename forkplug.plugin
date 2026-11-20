@@ -1,0 +1,1692 @@
+import json
+import math
+import time
+import traceback
+from typing import Any, Dict, List, Optional
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import run_on_ui_thread
+from client_utils import (
+    get_messages_controller,
+    get_user_config,
+    get_last_fragment,
+    send_request,
+    run_on_queue,
+)
+from ui.settings import Header, Switch, Selector, Input, EditText, Text, Divider
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+from java import jclass, jint
+from android.graphics import Paint, Path, RectF, Color
+from android.text import SpannableStringBuilder
+from android.widget import LinearLayout, TextView, ScrollView, ImageView
+from org.telegram.messenger import AndroidUtilities
+
+try:
+    from base_plugin import MethodHook
+except Exception:
+    try:
+        from hook_utils import MethodHook
+    except Exception:
+        MethodHook = None
+
+try:
+    from extera_utils.classes import Base, java_subclass, joverride
+except Exception:
+    Base = java_subclass = joverride = None
+
+__id__ = "forkplug"
+__name__ = "forkplug"
+__description__ = (
+    "Кастомизация: аватары в упоминаниях, анимации меню, M3 Expressive прогресс загрузки, "
+    "окно реакций, теги каналов и бейджи ролей"
+)
+__author__ = "@c0rei5"
+__version__ = "1.5.17"
+__icon__ = "Forkplug/0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+
+def dp(x: float) -> float:
+    return x * float(AndroidUtilities.density)
+
+
+def _jc(c):
+    """Force a Java *int* ARGB colour. A plain Python int would resolve Paint.setColor to the
+    setColor(long) overload (colour-long encoding) -> 'IllegalArgumentException: Invalid ID'."""
+    c = int(c) & 0xFFFFFFFF
+    if c >= 0x80000000:
+        c -= 0x100000000
+    return jint(c)
+
+
+def _L(value: int):
+    return jclass("java.lang.Long")(int(value))
+
+
+_JCACHE: Dict[str, Any] = {}
+
+
+def _static(cls_name: str, field: str):
+    """Static field of a (possibly nested) Java class. Nested classes are always
+    resolved through jclass('Outer$Inner'), which is the only form that is
+    guaranteed to work under Chaquopy."""
+    key = cls_name + "#" + field
+    v = _JCACHE.get(key)
+    if v is None:
+        v = getattr(jclass(cls_name), field)
+        _JCACHE[key] = v
+    return v
+
+
+def _style_stroke():
+    return _static("android.graphics.Paint$Style", "STROKE")
+
+
+def _style_fill():
+    return _static("android.graphics.Paint$Style", "FILL")
+
+
+def _cap_round():
+    return _static("android.graphics.Paint$Cap", "ROUND")
+
+
+def _join_round():
+    return _static("android.graphics.Paint$Join", "ROUND")
+
+
+def _new_tl(*names):
+    last = None
+    for n in names:
+        try:
+            return jclass(n)()
+        except Exception as e:  # noqa
+            last = e
+    raise last if last else RuntimeError("no TL class")
+
+
+ROLE_BADGES = {"tester": "tester", "user": "user"}
+PLACEHOLDER = "⠀⠀"
+FALLBACK_EMOJI = {"tester": "✅", "user": "☑️"}
+ROLE_ALIASES = {
+    "tester": "tester", "тестер": "tester", "тестировщик": "tester",
+    "user": "user", "пользователь": "user",
+}
+LIST_STYLES = ["Выкл", "Сдвиг у точки", "Масштаб у точки", "Сдвиг + масштаб", "Выбор: увеличение при скролле", "Выбор: увеличение всегда"]
+MENU_STYLES = ["Стандартная", "Масштаб", "Часы (маятник)", "Переворот 3D", "Растворение", "Покачивание"]
+
+# MediaActionDrawable icon ids
+ICON_DOWNLOAD = 2
+ICON_CANCEL_SET = (3, 12, 13, 14)
+
+_LOG = None
+_HOOK_STATS: Dict[str, Dict[str, Any]] = {}
+
+if MethodHook is not None:
+    class FnHook(MethodHook):
+        def __init__(self, name="", before=None, after=None):
+            try:
+                super().__init__()
+            except Exception:
+                pass
+            self._name = name
+            self._before = before
+            self._after = after
+            self._errors = 0
+            self._fired = False
+            self._st = _HOOK_STATS.setdefault(name, {"overloads": 0, "fired": 0, "errors": 0, "last": ""})
+
+        def _run(self, fn, param):
+            self._st["fired"] += 1
+            if not self._fired:
+                self._fired = True
+                if _LOG:
+                    _LOG.info("hook fired first time: " + self._name)
+            try:
+                fn(param)
+            except Exception:
+                self._errors += 1
+                self._st["errors"] += 1
+                self._st["last"] = traceback.format_exc()[-350:]
+                if _LOG and self._errors <= 5:
+                    _LOG.exception("hook error in " + self._name)
+
+        def before_hooked_method(self, param):
+            if self._before:
+                self._run(self._before, param)
+
+        def after_hooked_method(self, param):
+            if self._after:
+                self._run(self._after, param)
+else:
+    FnHook = None
+
+
+# Drawable that renders a real profile photo through Telegram's ImageReceiver.
+_PhotoDrawable = None
+try:
+    if java_subclass is not None:
+        Drawable = jclass("android.graphics.drawable.Drawable")
+
+        @java_subclass(Drawable)
+        class _PhotoDrawable(Base):
+            @joverride()
+            def draw(self, canvas):
+                try:
+                    r = self.receiver
+                    loaded = True
+                    try:
+                        loaded = bool(r.hasNotThumb())
+                    except Exception:
+                        pass
+                    if not loaded and self.tries < 12:
+                        now = time.time()
+                        if now - self.last > 0.8:
+                            self.last = now
+                            self.tries += 1
+                            r.setForUserOrChat(self.user, self.placeholder)
+                            r.onAttachedToWindow()
+                        self.plugin._schedule_refresh()
+                    r.setImageCoords(0.0, 0.0, float(self.w), float(self.h))
+                    r.draw(canvas)
+                except Exception:
+                    pass
+
+            @joverride()
+            def setAlpha(self, alpha):
+                pass
+
+            @joverride()
+            def setColorFilter(self, cf):
+                pass
+
+            @joverride()
+            def getOpacity(self):
+                return -3
+except Exception:
+    _PhotoDrawable = None
+
+
+# ----------------------------------------------------------------------------
+# plugin
+# ----------------------------------------------------------------------------
+
+class ForkPlug(BasePlugin):
+
+    # ------------------------------------------------------------ lifecycle
+    def on_plugin_load(self):
+        global _LOG
+        _LOG = self.logger
+        self._cell_roles: Dict[int, str] = {}
+        self._draw_ok = False
+        self._bind_count = 0
+        self._dbg_count = 0
+        self._avatar_peers: Dict[Any, Any] = {}
+        self._refresh_pending = False
+        self._resolving = set()
+        self._last_reaction_ts = 0.0
+        self._badge_paint = None
+        self._name_depth = 0
+        self._name_saved = None
+        self._avatar_cache: Dict[Any, Any] = {}
+        self._full_requested = set()
+        self._remote_roles: Dict[str, str] = {}
+        self._drawer_dirty = False
+        self._paint = None
+        self._path = None
+        self._prog_state: Dict[int, list] = {}
+        self._m3e_errors = 0
+        self._stage = ""
+        self._dlg_saved: Dict[int, int] = {}
+        self._dlg_last: Dict[int, float] = {}
+        self._scroll_t = 0.0
+
+        if FnHook is None:
+            self.logger.error("MethodHook not found: UI hooks disabled")
+        else:
+            self._install_hooks()
+
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Кто поставил реакции",
+                on_click=self._on_reactions_menu,
+                icon="msg_reactions",
+                priority=5,
+            ))
+        except Exception:
+            self.logger.exception("menu item failed")
+
+        self._load_remote_roles()
+        self._check_update(False)
+
+    def on_plugin_unload(self):
+        self._restore_name()
+
+    def _hook(self, clazz_name: str, method: str, before=None, after=None):
+        key = clazz_name + "." + method
+        st = _HOOK_STATS.setdefault(key, {"overloads": 0, "fired": 0, "errors": 0, "last": ""})
+        try:
+            clazz = find_class(clazz_name)
+            if not clazz:
+                st["overloads"] = -1
+                st["last"] = "класс не найден"
+                self.logger.error("class not found: " + clazz_name)
+                return
+            res = self.hook_all_methods(clazz, method, FnHook(key, before, after))
+            st["overloads"] = len(res) if res else 0
+            self.logger.info("hooked %s -> %s overloads" % (key, st["overloads"]))
+        except Exception:
+            st["overloads"] = -2
+            st["last"] = traceback.format_exc()[-350:]
+            self.logger.exception("hook failed " + key)
+
+    def _show_diag(self, *a):
+        try:
+            lines = []
+            for k, st in _HOOK_STATS.items():
+                short = k.replace("org.telegram.", "").replace("ui.", "")
+                state = {-1: "НЕТ КЛАССА", -2: "ОШИБКА ХУКА", 0: "НЕ ПОДКЛЮЧЁН"}.get(st["overloads"], "ок x%d" % st["overloads"])
+                lines.append("%s\n   %s, сработал %d, ошибок %d" % (short, state, st["fired"], st["errors"]))
+                if st["last"]:
+                    for ln in st["last"].strip().splitlines()[-3:]:
+                        lines.append("   " + ln[:160])
+            try:
+                dc = find_class(getattr(self, "_drawer_cls", "org.telegram.ui.ActionBar.DrawerLayoutContainer"))
+                names = None
+                for getter in (lambda: dc.getDeclaredMethods(),
+                               lambda: dc.class_.getDeclaredMethods(),
+                               lambda: jclass("java.lang.Class").forName(
+                                   getattr(self, "_drawer_cls", "org.telegram.ui.ActionBar.DrawerLayoutContainer")).getDeclaredMethods()):
+                    try:
+                        names = sorted(set(str(m.getName()) for m in getter()))
+                        break
+                    except Exception:
+                        continue
+                if names is None:
+                    raise RuntimeError("no methods")
+                lines.append("DrawerLayoutContainer методы:\n   " + ", ".join(names))
+            except Exception:
+                lines.append("методы Drawer: не прочитать")
+            tv = TextView(get_last_fragment().getParentActivity())
+            tv.setText("\n".join(lines) or "пусто")
+            tv.setTextSize(12.0)
+            tv.setPadding(int(dp(20)), int(dp(8)), int(dp(20)), int(dp(8)))
+            sv = ScrollView(get_last_fragment().getParentActivity())
+            sv.addView(tv)
+            b = AlertDialogBuilder(get_last_fragment().getParentActivity())
+            b.set_title("Диагностика forkplug")
+            b.set_view(sv)
+            b.set_positive_button("Закрыть", lambda bb, w: bb.dismiss())
+            b.show()
+        except Exception:
+            self.logger.exception("diag failed")
+
+    def _install_hooks(self):
+        self._hook("org.telegram.messenger.MessageObject", "generateLayout", before=self._on_generate_layout)
+        self._hook("org.telegram.messenger.MessageObject", "addLinks", after=self._on_add_links)
+        self._hook("org.telegram.ui.Cells.ChatMessageCell", "setMessageObject",
+                   before=self._on_cell_before, after=self._on_cell_after)
+        self._hook("org.telegram.ui.Components.MediaActionDrawable", "draw", before=self._on_media_draw)
+        for drawer_cls in ("org.telegram.ui.ActionBar.DrawerLayoutContainer",
+                           "org.telegram.ui.Components.DrawerLayoutContainer"):
+            if find_class(drawer_cls):
+                self._drawer_cls = drawer_cls
+                # the method names differ between Telegram versions: hook every candidate
+                self._hook(drawer_cls, "setDrawerPosition", after=self._on_drawer_position)
+                self._hook(drawer_cls, "moveDrawerByX", after=self._on_drawer_position)
+                self._hook(drawer_cls, "drawChild", before=self._on_drawer_position)
+                self._hook(drawer_cls, "dispatchDraw", before=self._on_drawer_position)
+                break
+        else:
+            self.logger.error("DrawerLayoutContainer not found")
+        self._hook("org.telegram.ui.Components.RadialProgressView", "onDraw", before=self._on_spinner_draw)
+        self._hook("org.telegram.ui.Cells.DialogCell", "onDraw",
+                   before=self._on_dialog_before, after=self._on_dialog_after)
+        self._hook("org.telegram.ui.Cells.ChatMessageCell", "drawNamesLayout", after=self._on_draw_names)
+        self._hook("org.telegram.ui.ChatActivity$ChatMessageCellDelegate", "didPressReaction",
+                   before=self._on_reaction_press)
+        self._hook("org.telegram.ui.ChatActivity", "didPressReaction", before=self._on_reaction_press)
+
+    # ------------------------------------------------------------- settings
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Чат"),
+            Switch(key="avatar_mentions", text="Аватар рядом с упоминанием",
+                   default=True, subtext="Аватар перед @упоминанием в сообщениях и в описании профиля",
+                   icon="msg_contacts"),
+            Switch(key="reactors_window", text="Окно реакций при удержании",
+                   default=True, subtext="Удержание реакции открывает список, кто её поставил",
+                   icon="msg_reactions"),
+
+            Selector(key="avatar_size", text="Размер аватара в упоминании", default=2,
+                     items=["Маленький", "Средний", "Большой", "Крупный"], icon="msg_contacts"),
+
+            Header(text="Загрузка файлов"),
+            Switch(key="m3e_progress", text="Material 3 Expressive индикатор",
+                   default=True, subtext="Волнистое кольцо, крестик отмены при загрузке, стрелка до её начала",
+                   icon="msg_download"),
+
+            Switch(key="m3e_spinner", text="M3E и в просмотре фото, и в спиннерах",
+                   default=True, subtext="Волнистое кольцо вместо обычного круга при загрузке фото и списков",
+                   icon="msg_photo_settings"),
+
+            Header(text="Анимации"),
+            Selector(key="menu_anim", text="Анимация главного меню", default=2,
+                     items=MENU_STYLES, icon="msg_theme"),
+
+            Selector(key="list_anim", text="Анимация чатов при прокрутке (невидимая точка)", default=1,
+                     items=LIST_STYLES, icon="msg_theme"),
+
+            Header(text="Обновления"),
+            Input(key="update_repo", text="GitHub репозиторий (пользователь/репо)", default="",
+                  subtext="В репозитории нужны файлы update.json и forkplug.plugin"),
+            Switch(key="auto_update", text="Проверять обновления при запуске", default=True,
+                   icon="msg_download"),
+            Text(text="Проверить обновления сейчас", on_click=lambda *a: self._check_update(True)),
+
+            Divider(),
+            Text(text="Диагностика хуков", on_click=self._show_diag),
+            Text(text="forkplug " + __version__),
+        ]
+
+    # ------------------------------------------------------------- updates
+    @staticmethod
+    def _ver_tuple(v: str):
+        out = []
+        for part in str(v).strip().lstrip("vV").split("."):
+            num = "".join(ch for ch in part if ch.isdigit())
+            out.append(int(num) if num else 0)
+        return tuple(out)
+
+    def _update_base(self) -> str:
+        repo = (self.get_setting("update_repo", "") or "").strip().strip("/")
+        if repo.startswith("http"):
+            return repo.rstrip("/")
+        return ("https://raw.githubusercontent.com/%s/main" % repo) if repo.count("/") == 1 else ""
+
+    def _check_update(self, manual: bool):
+        if not manual:
+            if not self.get_setting("auto_update", True):
+                return
+            if time.time() - float(self.get_setting("update_last_check", 0) or 0) < 6 * 3600:
+                return
+        base = self._update_base()
+        if not base:
+            if manual:
+                self._ui_info("Укажите репозиторий в настройках обновлений")
+            return
+
+        def work():
+            try:
+                import urllib.request
+                req = urllib.request.Request(base + "/update.json", headers={"Cache-Control": "no-cache"})
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                self.set_setting("update_last_check", time.time())
+                new_v = str(data.get("version", ""))
+                if self._ver_tuple(new_v) > self._ver_tuple(__version__):
+                    url = str(data.get("url") or (base + "/forkplug.plugin"))
+                    notes = str(data.get("changelog", "")).strip()
+                    run_on_ui_thread(lambda: self._update_dialog(new_v, url, notes))
+                elif manual:
+                    self._ui_info("Установлена последняя версия (%s)" % __version__)
+            except Exception as e:
+                self.logger.exception("update check failed")
+                if manual:
+                    self._ui_info("Не удалось проверить обновления: %s" % type(e).__name__)
+
+        run_on_queue(work)
+
+    def _update_dialog(self, new_v: str, url: str, notes: str):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            tv = TextView(activity)
+            tv.setText("Версия %s (у вас %s)\n\n%s" % (new_v, __version__, notes or "Список изменений не указан"))
+            tv.setTextSize(15.0)
+            tv.setPadding(int(dp(22)), int(dp(8)), int(dp(22)), int(dp(8)))
+            sv = ScrollView(activity)
+            sv.addView(tv)
+            b = AlertDialogBuilder(activity)
+            b.set_title("Доступно обновление forkplug")
+            b.set_view(sv)
+            b.set_positive_button("Обновить", lambda bb, w: (bb.dismiss(), self._download_update(url)))
+            try:
+                b.set_negative_button("Позже", lambda bb, w: bb.dismiss())
+            except Exception:
+                pass
+            b.show()
+        except Exception:
+            self.logger.exception("update dialog failed")
+
+    def _download_update(self, url: str):
+        self._ui_info("Скачиваю обновление…")
+
+        def work():
+            try:
+                import urllib.request, os
+                ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+                d = ctx.getExternalFilesDir(None)
+                folder = str(d.getAbsolutePath()) if d is not None else str(ctx.getCacheDir().getAbsolutePath())
+                path = os.path.join(folder, "forkplug_update.plugin")
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    data = r.read()
+                if len(data) < 2000 or b"__id__" not in data:
+                    raise ValueError("файл обновления повреждён")
+                with open(path, "wb") as f:
+                    f.write(data)
+                run_on_ui_thread(lambda: self._install_file(path))
+            except Exception as e:
+                self.logger.exception("update download failed")
+                self._ui_info("Не удалось скачать обновление: %s" % type(e).__name__)
+
+        run_on_queue(work)
+
+    def _install_file(self, path: str):
+        """Hand the downloaded .plugin to the client, exactly as if it was opened from a chat."""
+        try:
+            Intent = jclass("android.content.Intent")
+            File = jclass("java.io.File")
+            FileProvider = jclass("androidx.core.content.FileProvider")
+            activity = get_last_fragment().getParentActivity()
+            uri = FileProvider.getUriForFile(activity, str(activity.getPackageName()) + ".provider", File(path))
+            it = Intent(Intent.ACTION_VIEW)
+            it.setDataAndType(uri, "application/octet-stream")
+            it.addFlags(jint(1))            # FLAG_GRANT_READ_URI_PERMISSION
+            it.setPackage(activity.getPackageName())
+            activity.startActivity(it)
+        except Exception:
+            self.logger.exception("install intent failed")
+            self._ui_info("Файл скачан: %s. Откройте его, чтобы установить" % path)
+
+    # ------------------------------------------------------- roles and tags
+    def _load_remote_roles(self):
+        url = (self.get_setting("remote_url", "") or "").strip()
+        cached = self.get_setting("remote_cache", "")
+        if cached:
+            try:
+                self._remote_roles = json.loads(cached)
+            except Exception:
+                pass
+        if not url:
+            return
+
+        def work():
+            try:
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=10) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                roles = {}
+                for role, names in data.items():
+                    role = ROLE_ALIASES.get(str(role).lower())
+                    if not role:
+                        continue
+                    for n in names:
+                        roles[str(n).lower().lstrip("@")] = role
+                self._remote_roles = roles
+                self.set_setting("remote_cache", json.dumps(roles))
+            except Exception:
+                self.logger.exception("remote roles failed")
+
+        run_on_queue(work)
+
+    @staticmethod
+    def _parse_lines(text: str) -> Dict[str, str]:
+        out = {}
+        for line in (text or "").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k, v = k.strip().lower().lstrip("@"), v.strip()
+                if k and v:
+                    out[k] = v
+        return out
+
+    def _keys_for(self, user) -> List[str]:
+        keys = [str(user.id)]
+        try:
+            uname = user.username
+            if uname:
+                keys.append(str(uname).lower())
+        except Exception:
+            pass
+        return keys
+
+    def _role_for(self, user) -> Optional[str]:
+        keys = self._keys_for(user)
+        local = self._parse_lines(self.get_setting("roles_text", ""))
+        for k in keys:
+            if k in local:
+                return ROLE_ALIASES.get(local[k].lower())
+        for k in keys:
+            if k in self._remote_roles:
+                return self._remote_roles[k]
+        try:
+            if user.id == get_user_config().getClientUserId():
+                return "user"
+        except Exception:
+            pass
+        return None
+
+    def _tag_for(self, user) -> Optional[str]:
+        keys = self._keys_for(user)
+        manual = self._parse_lines(self.get_setting("tags_text", ""))
+        for k in keys:
+            if k in manual:
+                return manual[k][:6]
+        try:
+            if user.id == get_user_config().getClientUserId():
+                mine = (self.get_setting("my_tag", "") or "").strip()
+                if mine:
+                    return mine[:6]
+        except Exception:
+            pass
+        if False:
+            return self._personal_channel_tag(user)
+        return None
+
+    def _personal_channel_tag(self, user) -> Optional[str]:
+        try:
+            mc = get_messages_controller()
+            full = mc.getUserFull(_L(user.id))
+            if full is None:
+                if user.id not in self._full_requested:
+                    self._full_requested.add(user.id)
+                    mc.loadFullUser(user, 0, False)
+                return None
+            cid = int(full.personal_channel_id)
+            if not cid:
+                return None
+            chat = mc.getChat(_L(cid))
+            if chat is None:
+                return None
+            uname = chat.username
+            if uname:
+                return str(uname).upper()[:5]
+            title = str(chat.title or "").strip()
+            return title[:4].upper() if title else None
+        except Exception:
+            return None
+
+    # ----------------------------------------------- nick suffix (badge+tag)
+    def _on_cell_before(self, param):
+        self._name_depth += 1
+        if self._name_depth != 1:
+            return
+        if not (False or False):
+            return
+        try:
+            msg = param.args[0]
+            self._cell_roles[param.thisObject.hashCode()] = None
+            if msg is None or msg.isOutOwner():
+                return
+            peer = msg.messageOwner.from_id
+            uid = int(peer.user_id) if peer is not None else 0
+            if not uid:
+                return
+            user = get_messages_controller().getUser(_L(uid))
+            if user is None or user.deleted:
+                return
+            parts = []
+            role = None
+            if False:
+                role = self._role_for(user)
+                if role:
+                    self._bind_count += 1
+                    if self._draw_ok or self._bind_count < 40:
+                        parts.append(PLACEHOLDER)
+                    else:
+                        # drawNamesLayout never fired on this build: fall back to text emoji
+                        parts.append(FALLBACK_EMOJI[role])
+                        role = None
+            self._cell_roles[param.thisObject.hashCode()] = role
+            if False:
+                tag = self._tag_for(user)
+                if tag:
+                    parts.append("[" + tag + "]")
+            if not parts:
+                return
+            if len(self._cell_roles) > 500:
+                self._cell_roles.clear()
+            first, last = user.first_name, user.last_name
+            suffix = " " + " ".join(parts)
+            self._name_saved = (user, first, last)
+            if last:
+                user.last_name = str(last) + suffix
+            else:
+                user.first_name = str(first or "") + suffix
+        except Exception:
+            self._name_saved = None
+
+    def _on_cell_after(self, param):
+        self._name_depth = max(0, self._name_depth - 1)
+        if self._name_depth == 0:
+            self._restore_name()
+
+    def _restore_name(self):
+        saved = self._name_saved
+        self._name_saved = None
+        if saved:
+            try:
+                user, first, last = saved
+                user.first_name = first
+                user.last_name = last
+            except Exception:
+                pass
+
+    # -------------------------------------------------- avatars in mentions
+    AVATAR_SIZES = [(16, 19), (19, 22), (22, 25), (26, 29)]
+
+    def _avatar_dims(self):
+        idx = int(self.get_setting("avatar_size", 2) or 0)
+        idx = max(0, min(len(self.AVATAR_SIZES) - 1, idx))
+        d, wbox = self.AVATAR_SIZES[idx]
+        return int(dp(d)), int(dp(wbox))
+
+    def _avatar_for(self, user):
+        uid = int(user.id)
+        circle, box_w = self._avatar_dims()
+        key = (uid, circle)
+        cached = self._avatar_cache.get(key)
+        if cached is not None:
+            return cached
+        drawable = None
+        AvatarDrawable = jclass("org.telegram.ui.Components.AvatarDrawable")
+        placeholder = AvatarDrawable()
+        try:
+            placeholder.setInfo(user)
+        except Exception:
+            placeholder.setInfo(uid, str(user.first_name or ""), str(user.last_name or ""))
+        if _PhotoDrawable is not None:
+            try:
+                ImageReceiver = jclass("org.telegram.messenger.ImageReceiver")
+                recv = ImageReceiver()
+                recv.setRoundRadius(circle // 2)
+                recv.setForUserOrChat(user, placeholder)
+                recv.onAttachedToWindow()
+                peer = _PhotoDrawable.new_instance()
+                peer.receiver = recv
+                peer.user = user
+                peer.placeholder = placeholder
+                peer.plugin = self
+                peer.tries = 0
+                peer.last = time.time()
+                peer.w, peer.h = circle, circle
+                drawable = peer.java
+                drawable.setBounds(0, 0, box_w, circle)
+                self._avatar_peers[key] = peer  # strong ref: otherwise the Python half gets collected
+            except Exception:
+                self.logger.exception("photo avatar failed, using placeholder")
+                drawable = None
+        if drawable is None:
+            placeholder.setBounds(0, 0, circle, circle)
+            drawable = placeholder
+        if len(self._avatar_cache) > 300:
+            self._avatar_cache.clear()
+            self._avatar_peers.clear()
+        self._avatar_cache[key] = drawable
+        return drawable
+
+    def _schedule_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def work():
+            self._refresh_pending = False
+            try:
+                frag = get_last_fragment()
+                lv = get_private_field(frag, "chatListView")
+                if lv is not None:
+                    for i in range(lv.getChildCount()):
+                        lv.getChildAt(i).invalidate()
+            except Exception:
+                pass
+
+        run_on_ui_thread(work, 450)
+
+    def _resolve_async(self, name: str):
+        if name in self._resolving or len(self._resolving) > 200:
+            return
+        self._resolving.add(name)
+        try:
+            req = _new_tl("org.telegram.tgnet.TLRPC$TL_contacts_resolveUsername",
+                          "org.telegram.tgnet.tl.TL_contacts$resolveUsername")
+            req.username = name
+
+            def cb(resp, err):
+                try:
+                    if resp is not None and not err:
+                        mc = get_messages_controller()
+                        mc.putUsers(resp.users, False)
+                        mc.putChats(resp.chats, False)
+                except Exception:
+                    pass
+
+            send_request(req, cb)
+        except Exception:
+            pass
+
+    def _decorate(self, text, in_place: bool):
+        """Insert avatar spans before @mentions. Returns the builder or None."""
+        if text is None or not hasattr(text, "getSpans"):
+            return None
+        n = text.length()
+        if n == 0:
+            return None
+        URLSpan = jclass("android.text.style.URLSpan")
+        ImageSpan = jclass("android.text.style.ImageSpan")
+        spans = text.getSpans(0, n, URLSpan)
+        mc = get_messages_controller()
+        found = []
+        for sp in spans:
+            try:
+                url = str(sp.getURL() or "")
+                kind = str(sp.getClass().getSimpleName())
+                user = None
+                if kind == "URLSpanUserMention" and url.isdigit():
+                    user = mc.getUser(_L(int(url)))
+                elif url.startswith("@") and len(url) > 1:
+                    obj = mc.getUserOrChat(url[1:])
+                    if obj is None:
+                        self._resolve_async(url[1:])
+                    elif str(obj.getClass().getSimpleName()).startswith("TL_user"):
+                        user = obj
+                if user is None:
+                    continue
+                start = text.getSpanStart(sp)
+                if start > 0 and str(text.charAt(start - 1)) == "​":
+                    continue  # already processed
+                found.append((start, user))
+            except Exception:
+                continue
+        if not found:
+            return None
+        if in_place:
+            sb = text
+        else:
+            sb = SpannableStringBuilder(text)
+        found.sort(key=lambda x: -x[0])
+        for start, user in found:
+            try:
+                sb.insert(start, "​")
+                sb.setSpan(ImageSpan(self._avatar_for(user), 0), start, start + 1, 33)
+            except Exception:
+                self.logger.exception("avatar span failed")
+        return sb
+
+    def _on_generate_layout(self, param):
+        if not self.get_setting("avatar_mentions", True):
+            return
+        mo = param.thisObject
+        sb = self._decorate(mo.messageText, in_place=False)
+        if sb is not None:
+            set_private_field(mo, "messageText", sb)
+
+    def _on_add_links(self, param):
+        """Profile / group / channel descriptions (and any text built via addLinks)."""
+        if not self.get_setting("avatar_mentions", True):
+            return
+        args = param.args
+        if len(args) < 2:
+            return
+        text = args[1]
+        if text is None or not hasattr(text, "insert") or not hasattr(text, "getSpans"):
+            return  # only mutable Spannable can be changed in place
+        self._decorate(text, in_place=True)
+
+    # ------------------------------------------- M3 Expressive load progress
+    def _ensure_paint(self):
+        if self._paint is None:
+            p = Paint(Paint.ANTI_ALIAS_FLAG)
+            p.setStyle(_style_stroke())
+            p.setStrokeCap(_cap_round())
+            p.setStrokeJoin(_join_round())
+            self._paint = p
+            self._path = Path()
+        else:
+            # other code paths may have switched the style; always restore it
+            self._paint.setStyle(_style_stroke())
+            self._paint.setStrokeCap(_cap_round())
+        return self._paint
+
+    @staticmethod
+    def _wave_count(ring_r: float) -> int:
+        try:
+            return max(7, min(15, int(round(2.0 * math.pi * ring_r / dp(10)))))
+        except Exception:
+            return 9
+
+    def _wavy_arc(self, canvas, cx, cy, ring_r, amp, waves, start, sweep, phase, paint):
+        """Draw a sine-modulated arc (the 'expressive' wavy progress track)."""
+        path = self._path
+        path.reset()
+        steps = max(16, int(sweep / 3)) if math.isfinite(sweep) else 16
+        for i in range(steps + 1):
+            a = math.radians(start + sweep * i / steps)
+            rr = ring_r + amp * math.sin(waves * a + phase)
+            x = cx + rr * math.cos(a)
+            y = cy + rr * math.sin(a)
+            if i == 0:
+                path.moveTo(float(x), float(y))
+            else:
+                path.lineTo(float(x), float(y))
+        self._stage = "wavy-draw"
+        canvas.drawPath(path, paint)
+
+    @staticmethod
+    def _icon_of(d) -> int:
+        try:
+            return int(d.getCurrentIcon())
+        except Exception:
+            pass
+        for name in ("nextIcon", "currentIcon"):
+            try:
+                v = get_private_field(d, name)
+                if v is not None:
+                    return int(v)
+            except Exception:
+                pass
+        return -1
+
+    @staticmethod
+    def _target_progress(d) -> float:
+        # NB: 'animatedDownloadProgress' is advanced inside the original draw(), which we
+        # replace, so it would stay frozen. 'downloadProgress' is the real target value.
+        for name in ("downloadProgress", "currentProgress", "progress", "animatedDownloadProgress"):
+            try:
+                v = get_private_field(d, name)
+                if v is not None:
+                    return max(0.0, min(1.0, float(v)))
+            except Exception:
+                pass
+        return 0.0
+
+    def _smooth_progress(self, d, target: float) -> float:
+        key = d.hashCode()
+        now = time.time()
+        st = self._prog_state.get(key)
+        if st is None or now - st[1] > 1.0:
+            st = [target, now]
+        else:
+            dt = min(0.1, now - st[1])
+            if target < st[0]:
+                st[0] = target
+            else:
+                st[0] += (target - st[0]) * min(1.0, dt * 9.0)
+            st[1] = now
+        if len(self._prog_state) > 200:
+            self._prog_state.clear()
+        self._prog_state[key] = st
+        return st[0]
+
+    def _on_media_draw(self, param):
+        if not self.get_setting("m3e_progress", True):
+            return
+        d = param.thisObject
+        icon = self._icon_of(d)
+        if icon != ICON_DOWNLOAD and icon not in ICON_CANCEL_SET:
+            return
+        canvas = param.args[0]
+        try:
+            ok = self._draw_m3e(d, canvas, icon)
+        except Exception:
+            self._m3e_errors += 1
+            if self._m3e_errors <= 3:
+                self.logger.exception("m3e draw failed")
+            return
+        if ok:
+            param.setResult(None)
+
+    def _draw_m3e(self, d, canvas, icon) -> bool:
+        b = d.getBounds()
+        size = float(min(b.width(), b.height()))
+        if size < dp(20):
+            return False
+        p = self._ensure_paint()
+        cx, cy = float(b.exactCenterX()), float(b.exactCenterY())
+        r = size / 2.0
+        stroke = max(dp(2.2), r * 0.10)
+        ring_r = r - stroke * 1.9
+        amp = stroke * 0.55
+        waves = self._wave_count(ring_r)
+        t = time.time()
+        rect = RectF(float(cx - ring_r), float(cy - ring_r), float(cx + ring_r), float(cy + ring_r))
+        p.setStrokeWidth(float(stroke))
+
+        downloading = icon in ICON_CANCEL_SET
+        if downloading:
+            prog = self._smooth_progress(d, self._target_progress(d))
+            if prog < 0.02:
+                sweep = 100.0
+                start = -90.0 + (t * 300.0) % 360.0
+            else:
+                sweep = max(10.0, prog * 360.0)
+                start = -90.0
+            phase = -t * 2.0 * math.pi * 0.9
+        else:
+            sweep, start, phase = 360.0, -90.0, 0.0
+
+        # inactive track (straight, faded)
+        remaining = 360.0 - sweep
+        gap = math.degrees((stroke * 2.4) / ring_r)
+        if downloading and remaining > gap * 2 + 4:
+            p.setColor(_jc(Color.argb(90, 255, 255, 255)))
+            canvas.drawArc(rect, float(start + sweep + gap), float(remaining - gap * 2), False, p)
+
+        # active wavy track
+        p.setColor(_jc(Color.argb(255 if downloading else 120, 255, 255, 255)))
+        self._wavy_arc(canvas, cx, cy, ring_r, amp, waves, start, sweep, phase, p)
+
+        # center glyph
+        p.setStrokeWidth(float(stroke * 0.9))
+        p.setColor(_jc(Color.argb(255, 255, 255, 255)))
+        s = r * 0.26
+        if downloading:
+            canvas.drawLine(float(cx - s), float(cy - s), float(cx + s), float(cy + s), p)
+            canvas.drawLine(float(cx + s), float(cy - s), float(cx - s), float(cy + s), p)
+            try:
+                d.invalidateSelf()
+            except Exception:
+                pass
+        else:
+            canvas.drawLine(float(cx), float(cy - s * 0.9), float(cx), float(cy + s * 0.7), p)
+            canvas.drawLine(float(cx - s * 0.7), float(cy), float(cx), float(cy + s * 0.75), p)
+            canvas.drawLine(float(cx + s * 0.7), float(cy), float(cx), float(cy + s * 0.75), p)
+            canvas.drawLine(float(cx - s * 0.85), float(cy + s * 1.25), float(cx + s * 0.85), float(cy + s * 1.25), p)
+        return True
+
+    # ------------------------------------------------- Telegram-style badges
+    def _on_draw_names(self, param):
+        if not False:
+            return
+        cell = param.thisObject
+        role = self._cell_roles.get(cell.hashCode())
+        if not role:
+            return
+        self._draw_ok = True
+        layout = get_private_field(cell, "nameLayout")
+        if layout is None:
+            self._dbg("badge: nameLayout is None")
+            return
+        text = str(layout.getText().toString())
+        idx = text.find(PLACEHOLDER)
+        if idx < 0:
+            self._dbg("badge: placeholder not in name text: " + text[:40])
+            return
+        canvas = param.args[0]
+        alpha = float(param.args[1]) if len(param.args) > 1 else 1.0
+        nx = float(get_private_field(cell, "nameX") or 0.0)
+        ny = float(get_private_field(cell, "nameY") or 0.0)
+        off = get_private_field(cell, "nameOffsetX")
+        nx -= float(off) if off is not None else 0.0
+        x1 = float(layout.getPrimaryHorizontal(idx))
+        x2 = float(layout.getPrimaryHorizontal(idx + len(PLACEHOLDER)))
+        left, right = min(x1, x2), max(x1, x2)
+        size = min(right - left, (layout.getLineBottom(0) - layout.getLineTop(0)) * 0.95)
+        if size < dp(6):
+            self._dbg("badge: size too small %s" % size)
+            return
+        cx = nx + (left + right) / 2.0
+        cy = ny + (layout.getLineTop(0) + layout.getLineBottom(0)) / 2.0
+        self._draw_badge(canvas, role, cx, cy, size / 2.0, alpha)
+
+    def _dbg(self, msg: str):
+        if self._dbg_count < 12:
+            self._dbg_count += 1
+            self.logger.info(msg)
+
+    def _draw_badge(self, canvas, role, cx, cy, r, alpha):
+        if self._badge_paint is None:
+            self._badge_paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        p = self._badge_paint
+        path = Path()
+        a255 = int(max(0.0, min(1.0, alpha)) * 255)
+        p.setShader(None)
+        p.setPathEffect(None)
+        # scalloped seal (like the verified badge) + check
+        color = Color.rgb(51, 144, 236) if role == "user" else Color.rgb(76, 175, 80)
+        p.setStyle(_style_fill())
+        p.setColor(_jc(color))
+        p.setAlpha(a255)
+        steps = 72
+        for i in range(steps + 1):
+            ang = 2 * math.pi * i / steps
+            rr = r * (0.93 + 0.07 * math.cos(10 * ang))
+            x, y = cx + rr * math.cos(ang), cy + rr * math.sin(ang)
+            if i == 0:
+                path.moveTo(float(x), float(y))
+            else:
+                path.lineTo(float(x), float(y))
+        path.close()
+        canvas.drawPath(path, p)
+        p.setStyle(_style_stroke())
+        p.setStrokeCap(_cap_round())
+        p.setStrokeJoin(_join_round())
+        p.setStrokeWidth(float(max(1.0, r * 0.16)))
+        p.setColor(_jc(Color.rgb(255, 255, 255)))
+        p.setAlpha(a255)
+        chk = Path()
+        chk.moveTo(float(cx - r * 0.38), float(cy + r * 0.02))
+        chk.lineTo(float(cx - r * 0.1), float(cy + r * 0.3))
+        chk.lineTo(float(cx + r * 0.4), float(cy - r * 0.26))
+        canvas.drawPath(chk, p)
+
+    # ---------------------------------------------------- M3E generic spinner
+    def _on_spinner_draw(self, param):
+        self._stage = "start"
+        try:
+            self._spinner_impl(param)
+        except Exception as e:
+            key = "org.telegram.ui.Components.RadialProgressView.onDraw"
+            try:
+                _HOOK_STATS[key]["last"] = "ERR stage=%s %s: %s" % (
+                    self._stage, type(e).__name__, str(e).strip().splitlines()[0][:140] if str(e).strip() else "")
+            except Exception:
+                pass
+            try:
+                self._stage = "fallback"
+                self._spinner_fallback(param)   # still replace the stock spinner
+            except Exception as e2:
+                try:
+                    _HOOK_STATS[key]["last"] += "\nfallback failed: %s: %s" % (
+                        type(e2).__name__, str(e2).strip().splitlines()[0][:100] if str(e2).strip() else "")
+                except Exception:
+                    pass
+
+    def _spinner_fallback(self, param):
+        """Minimal, float-only replacement: rotating round-cap arc with a breathing sweep."""
+        v = param.thisObject
+        canvas = param.args[0]
+        w = float(v.getMeasuredWidth())
+        h = float(v.getMeasuredHeight())
+        size = min(w, h)
+        if not (size > 0.0) or not math.isfinite(size):
+            return
+        stroke = max(dp(1.6), size * 0.09)
+        r = size / 2.0 - stroke
+        if not (r > 1.0):
+            return
+        color = Color.rgb(255, 255, 255)
+        try:
+            pp = get_private_field(v, "progressPaint")
+            if pp is not None:
+                color = pp.getColor()
+        except Exception:
+            pass
+        p = self._ensure_paint()
+        p.setStrokeWidth(float(stroke))
+        p.setColor(_jc(color))
+        t = time.time()
+        sweep = 80.0 + 110.0 * (0.5 + 0.5 * math.sin(t * 2.4))
+        start = (t * 320.0) % 360.0
+        cx, cy = w / 2.0, h / 2.0
+        canvas.drawArc(RectF(float(cx - r), float(cy - r), float(cx + r), float(cy + r)),
+                       float(start), float(sweep), False, p)
+        v.postInvalidateOnAnimation()
+        param.setResult(None)
+        try:
+            _HOOK_STATS["org.telegram.ui.Components.RadialProgressView.onDraw"]["last"] += " | fallback arc drawn"
+        except Exception:
+            pass
+
+    def _spinner_impl(self, param):
+        if not self.get_setting("m3e_spinner", True):
+            return
+
+        def fin(x, default):
+            try:
+                x = float(x)
+                return x if math.isfinite(x) else default
+            except Exception:
+                return default
+
+        v = param.thisObject
+        canvas = param.args[0]
+        key = "org.telegram.ui.Components.RadialProgressView.onDraw"
+
+        def note(msg):
+            try:
+                _HOOK_STATS[key]["last"] = msg
+            except Exception:
+                pass
+
+        w, h = fin(v.getMeasuredWidth(), 0.0), fin(v.getMeasuredHeight(), 0.0)
+        if w <= 0 or h <= 0:
+            note("skip: not measured w=%r h=%r" % (w, h))
+            return
+        size = min(w, h)  # the view is measured to its own diameter: no private fields needed
+        if size < dp(10):
+            note("skip: tiny size=%.0f (min %.0f)" % (size, dp(10)))
+            return
+        paint = None
+        try:
+            paint = get_private_field(v, "progressPaint")
+        except Exception:
+            pass
+        try:
+            color = int(paint.getColor()) if paint is not None else Color.rgb(255, 255, 255)
+        except Exception:
+            color = Color.rgb(255, 255, 255)
+        # NB: Color.red()/alpha() resolve to the (long)->float overloads here and return NaN:
+        # split the ARGB int with plain bit operations instead
+        c32 = int(color) & 0xFFFFFFFF
+        base_alpha = ((c32 >> 24) & 0xFF) or 255
+        rgb = ((c32 >> 16) & 0xFF, (c32 >> 8) & 0xFF, c32 & 0xFF)
+        stroke = max(dp(1.4), size * 0.09)
+        amp = stroke * 0.55
+        ring_r = size / 2.0 - stroke * 1.6 - amp
+        if not math.isfinite(ring_r) or ring_r < dp(2):
+            note("skip: bad ring_r=%r size=%.0f" % (ring_r, size))
+            return
+        self._stage = "paint"
+        p = self._ensure_paint()
+        t = time.time()
+        cx, cy = w / 2.0, h / 2.0
+        waves = self._wave_count(ring_r)
+        no_progress = get_private_field(v, "noProgress")
+        cur = fin(get_private_field(v, "currentProgress"), 0.0)
+        if no_progress is False and cur > 0.0:
+            sweep = max(10.0, min(1.0, cur) * 360.0)
+            start = -90.0
+        else:
+            sweep = 80.0 + 110.0 * (0.5 + 0.5 * math.sin(t * 2.4))
+            start = (t * 320.0) % 360.0
+        phase = -t * 2.0 * math.pi * 0.9
+        p.setStrokeWidth(float(stroke))
+        rect = RectF(float(cx - ring_r), float(cy - ring_r), float(cx + ring_r), float(cy + ring_r))
+        remaining = 360.0 - sweep
+        gap = math.degrees((stroke * 2.4) / ring_r)
+        if remaining > gap * 2 + 4:
+            self._stage = "track"
+            p.setColor(_jc((int(base_alpha * 0.3) << 24) | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]))
+            canvas.drawArc(rect, float(start + sweep + gap), float(remaining - gap * 2), False, p)
+        p.setColor(_jc((base_alpha << 24) | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]))
+        self._stage = "wavy"
+        self._wavy_arc(canvas, cx, cy, ring_r, amp, waves, start, sweep, phase, p)
+        self._stage = "post"
+        v.postInvalidateOnAnimation()
+        param.setResult(None)
+        try:
+            _HOOK_STATS["org.telegram.ui.Components.RadialProgressView.onDraw"]["last"] = (
+                "dbg drawn size=%.0f ring_r=%.1f w=%.0f h=%.0f" % (size, ring_r, w, h))
+        except Exception:
+            pass
+
+    # ------------------------------------------------- chat list scroll animation
+    # An invisible focus point sits in the middle of the list. While the list scrolls,
+    # every chat row that is inside the point's field of view is pushed aside / scaled
+    # (smooth bump, strongest right at the point); rows outside it stay at their place,
+    # and everything eases back to rest when the scrolling stops.
+    def _on_dialog_before(self, param):
+        style = int(self.get_setting("list_anim", 1) or 0)
+        if style == 0:
+            return
+        cell = param.thisObject
+        parent = cell.getParent()
+        if parent is None or not hasattr(parent, "canScrollVertically"):
+            return
+        ph = float(parent.getHeight())
+        h = float(cell.getHeight())
+        w = float(cell.getWidth())
+        if ph <= 0 or h <= 0:
+            return
+        now = time.time()
+        cy = float(cell.getTop()) + float(cell.getTranslationY()) + h / 2.0
+        last = self._dlg_last.get(id(cell))
+        self._dlg_last[id(cell)] = cy
+        if len(self._dlg_last) > 120:
+            self._dlg_last.clear()
+        if last is not None and abs(cy - last) > 0.5:
+            self._scroll_t = now
+        act = 1.0 - (now - self._scroll_t) / 0.35
+        act = max(0.0, min(1.0, act))
+        act = act * act * (3.0 - 2.0 * act)
+        # the point slides from the first row (list scrolled to the very top) to the middle
+        try:
+            off = float(parent.computeVerticalScrollOffset())
+        except Exception:
+            off = ph  # unknown: behave as if scrolled away from the top
+        t = max(0.0, min(1.0, off / (ph * 0.45)))
+        top_y = float(parent.getPaddingTop()) + h / 2.0
+        fy = top_y + (ph * 0.5 - top_y) * t
+        zone = (h * 1.4) if style in (4, 5) else (ph * 0.28)
+        dist = abs(cy - fy) / zone                   # 0 at the point, 1 at the edge of its field
+        bump = 0.0 if dist >= 1.0 else 0.5 * (1.0 + math.cos(math.pi * dist))
+        e = bump * act
+        if style == 4:
+            e = bump * max(act, 1.0 - t)  # at the very top the first row stays enlarged
+        elif style == 5:
+            e = bump  # picker mode: the row under the point stays enlarged
+        try:
+            _HOOK_STATS["org.telegram.ui.Cells.DialogCell.onDraw"]["last"] = (
+                "dbg ph=%.0f cy=%.0f fy=%.0f t=%.2f act=%.2f bump=%.2f" % (ph, cy, fy, t, act, bump))
+        except Exception:
+            pass
+        if e <= 0.01:
+            return
+        canvas = param.args[0]
+        saved = canvas.save()
+        if style in (4, 5):
+            sc = 1.0 + 0.08 * e
+            canvas.scale(float(sc), float(sc), float(w / 2.0), float(h / 2.0))
+        if style in (2, 3):
+            sc = 1.0 - 0.07 * e
+            canvas.scale(float(sc), float(sc), 0.0, float(h / 2.0))
+        if style in (1, 3):
+            canvas.translate(float(dp(26) * e), 0.0)
+        self._dlg_saved[id(cell)] = saved
+
+    def _on_dialog_after(self, param):
+        cell = param.thisObject
+        saved = self._dlg_saved.pop(id(cell), None)
+        if saved is not None:
+            param.args[0].restoreToCount(int(saved))
+        # keep redrawing while the rows ease back to rest
+        if time.time() - self._scroll_t < 0.4:
+            cell.postInvalidateOnAnimation()
+
+    # ------------------------------------------------------ drawer animation
+    def _on_drawer_position(self, param):
+        style = int(self.get_setting("menu_anim", 2) or 0)
+        if style == 0 and not self._drawer_dirty:
+            return
+        container = param.thisObject
+        view = get_private_field(container, "drawerLayout")
+        if view is None and container.getChildCount() > 1:
+            view = container.getChildAt(1)
+        if view is None:
+            return
+        if len(param.args) >= 2 and hasattr(param.args[1], "getMeasuredWidth") and not view.equals(param.args[1]):
+            return  # drawChild of some other child
+        w = float(view.getMeasuredWidth())
+        h = float(view.getMeasuredHeight())
+        if w <= 0:
+            return
+
+        # the original has already moved the view: translationX is the ground truth
+        tx = float(view.getTranslationX())
+        rtl = tx < -0.5
+        prog = max(0.0, min(1.0, abs(tx) / w))
+        if prog <= 0.0 and style != 0:
+            pos = get_private_field(container, "drawerPosition")
+            if pos is not None:
+                prog = max(0.0, min(1.0, abs(float(pos)) / w))
+
+        e = 1.0 - prog
+        sign = -1.0 if rtl else 1.0
+        hinge_x = 0.0 if rtl else w          # edge of the menu that touches the screen edge
+        view.setCameraDistance(float(dp(1600)))
+        pivot_x, pivot_y = hinge_x, h / 2.0
+        scale, rot, rot_y, alpha = 1.0, 0.0, 0.0, 1.0
+
+        if style == 1:      # scale + fade
+            scale = 0.80 + 0.20 * prog
+            alpha = 0.30 + 0.70 * prog
+        elif style == 2:    # pendulum swinging from the top corner
+            pivot_y = 0.0
+            rot = sign * 42.0 * e * math.cos(prog * math.pi * 1.5)
+            alpha = 0.55 + 0.45 * prog
+        elif style == 3:    # 3D door flip around the screen edge
+            rot_y = -sign * 78.0 * e
+            alpha = 0.4 + 0.6 * prog
+        elif style == 4:    # dissolve
+            alpha = prog ** 1.4
+            scale = 0.94 + 0.06 * prog
+        elif style == 5:    # wobble
+            rot = sign * math.sin(prog * math.pi * 3.0) * e * 11.0
+
+        view.setPivotX(float(pivot_x))
+        view.setPivotY(float(pivot_y))
+        view.setScaleX(float(scale))
+        view.setScaleY(float(scale))
+        view.setRotation(float(rot))
+        view.setRotationY(float(rot_y))
+        view.setAlpha(float(alpha))
+        try:
+            lt = 2 if (style != 0 and 0.0 < prog < 1.0) else 0
+            if int(view.getLayerType()) != lt:
+                view.setLayerType(lt, None)
+            if lt == 2:
+                container.postInvalidateOnAnimation()
+        except Exception:
+            pass
+        self._drawer_dirty = style != 0
+        try:
+            st = _HOOK_STATS.get(self._drawer_cls + ".dispatchDraw")
+            if st is not None:
+                st["last"] = "dbg style=%d tx=%.0f w=%.0f pos=%s prog=%.2f alpha=%.2f scale=%.2f via=%s" % (
+                    style, tx, w, get_private_field(container, "drawerPosition"), prog, alpha, scale,
+                    "drawerLayout" if get_private_field(container, "drawerLayout") is not None else "child1")
+        except Exception:
+            pass
+
+    # --------------------------------------------------------- reactors list
+    def _on_reaction_press(self, param):
+        if not self.get_setting("reactors_window", True):
+            return
+        key = "org.telegram.ui.ChatActivity$ChatMessageCellDelegate.didPressReaction"
+
+        def note(msg):
+            for k in (key, "org.telegram.ui.ChatActivity.didPressReaction"):
+                try:
+                    _HOOK_STATS[k]["last"] = msg
+                except Exception:
+                    pass
+
+        cell = rc = None
+        longpress = False
+        kinds = []
+        for a in param.args:
+            kinds.append(type(a).__name__)
+            if isinstance(a, bool):
+                longpress = a
+            elif a is not None and hasattr(a, "getMessageObject"):
+                cell = a
+            elif a is not None and hasattr(a, "reaction"):
+                rc = a
+        if not longpress or cell is None or rc is None:
+            note("dbg skip long=%s cell=%s rc=%s args=%s" % (longpress, cell is not None, rc is not None, ",".join(kinds)))
+            return
+        now = time.time()
+        if now - self._last_reaction_ts < 0.6:
+            param.setResult(None)
+            return
+        self._last_reaction_ts = now
+        msg = cell.getMessageObject()
+        if msg is None:
+            note("dbg skip: no message")
+            return
+        note("dbg hold -> opening window")
+        try:
+            self._show_reactors(msg, rc.reaction)
+        except Exception as e:
+            note("ERR window: %s: %s" % (type(e).__name__, str(e).strip().splitlines()[0][:120] if str(e).strip() else ""))
+            self.logger.exception("reactors window failed")
+            return
+        param.setResult(None)
+
+    def _on_reactions_menu(self, context: Dict[str, Any]):
+        msg = context.get("message")
+        if msg is not None:
+            self._show_reactors(msg, None)
+
+    @staticmethod
+    def _reaction_text(r) -> str:
+        try:
+            cn = str(r.getClass().getSimpleName()).lower()
+        except Exception:
+            cn = ""
+        if "paid" in cn:
+            return "⭐"
+        if "custom" in cn:
+            return "✨"
+        try:
+            e = r.emoticon
+            if e:
+                return str(e)
+        except Exception:
+            pass
+        return "❤"
+
+    @staticmethod
+    def _peer_key(peer):
+        if peer is None:
+            return None
+        try:
+            cn = str(peer.getClass().getSimpleName()).lower()
+        except Exception:
+            return None
+        for word, kind in (("user", "u"), ("channel", "c"), ("chat", "c")):
+            if word in cn:
+                try:
+                    val = int(getattr(peer, word + "_id"))
+                except Exception:
+                    return None
+                return (kind, val) if val else None
+        return None
+
+    @staticmethod
+    def _lookup_peer(mc, key):
+        try:
+            if key[0] == "u":
+                return mc.getUser(_L(key[1]))
+            return mc.getChat(_L(key[1]))
+        except Exception:
+            return None
+
+    def _collect_groups(self, pairs, mc, people=None, only=None):
+        """pairs: iterable of (peer, reaction). Returns {emoji: [(kind, obj)]}."""
+        groups: Dict[str, list] = {}
+        seen = set()
+        for peer, reaction in pairs:
+            key = self._peer_key(peer)
+            if key is None:
+                continue
+            text = self._reaction_text(reaction)
+            if only is not None and text != only:
+                continue
+            if (key, text) in seen:
+                continue
+            seen.add((key, text))
+            obj = people.get(key) if people else None
+            if obj is None:
+                obj = self._lookup_peer(mc, key)
+            if obj is None:
+                continue
+            groups.setdefault(text, []).append((key[0], obj))
+        return groups
+
+    def _local_groups(self, msg, mc, only):
+        """Fallback: reactions the client already has inside the message itself."""
+        try:
+            reactions = msg.messageOwner.reactions
+            recent = reactions.recent_reactions if reactions is not None else None
+            if recent is None:
+                return {}
+            return self._collect_groups([(pr.peer_id, pr.reaction) for pr in recent], mc, None, only)
+        except Exception:
+            self.logger.exception("local reactors failed")
+            return {}
+
+    def _ui_info(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_info(text))
+
+    def _show_reactors(self, msg, reaction):
+        mc = get_messages_controller()
+        only = self._reaction_text(reaction) if reaction is not None else None
+        try:
+            dialog_id = int(msg.getDialogId())
+            msg_id = int(msg.getId())
+            req = _new_tl("org.telegram.tgnet.TLRPC$TL_messages_getMessageReactionsList",
+                          "org.telegram.tgnet.tl.TL_messages$getMessageReactionsList",
+                          "org.telegram.tgnet.tl.TL_messages$TL_messages_getMessageReactionsList")
+            req.peer = mc.getInputPeer(dialog_id)
+            req.id = msg_id
+            req.limit = 100
+            if reaction is not None:
+                req.flags |= 1
+                req.reaction = reaction
+        except Exception:
+            self.logger.exception("reactors request build failed")
+            groups = self._local_groups(msg, mc, only)
+            if groups:
+                self._reactors_dialog(groups)
+            else:
+                self._ui_info("Не удалось создать запрос реакций")
+            return
+
+        def on_response(resp, err):
+            try:
+                if err is not None or resp is None:
+                    code = ""
+                    try:
+                        code = str(err.text)
+                    except Exception:
+                        pass
+                    groups = self._local_groups(msg, mc, only)
+                    if groups:
+                        run_on_ui_thread(lambda: self._reactors_dialog(groups))
+                    elif self._has_counts(msg):
+                        # e.g. BROADCAST_FORBIDDEN: reactions in channels are anonymous
+                        anon = "BROADCAST" in code.upper() or "FORBIDDEN" in code.upper()
+                        run_on_ui_thread(lambda: self._counts_dialog(msg, anon))
+                    else:
+                        self._ui_info("Список реакций недоступен" + (": " + code if code else ""))
+                    return
+                people = {}
+                for u in resp.users:
+                    people[("u", int(u.id))] = u
+                for c in resp.chats:
+                    people[("c", int(c.id))] = c
+                groups = self._collect_groups([(pr.peer_id, pr.reaction) for pr in resp.reactions],
+                                              mc, people, None)
+                if not groups:
+                    groups = self._local_groups(msg, mc, only)
+                run_on_ui_thread(lambda: self._reactors_dialog(groups))
+            except Exception:
+                self.logger.exception("reactors parse failed")
+                self._ui_info("Ошибка окна реакций, см. лог")
+
+        send_request(req, on_response)
+
+    @staticmethod
+    def _has_counts(msg) -> bool:
+        try:
+            r = msg.messageOwner.reactions
+            return r is not None and r.results is not None and int(r.results.size()) > 0
+        except Exception:
+            return False
+
+    def _counts_dialog(self, msg, anonymous: bool):
+        """Who is unknown (anonymous channel reactions): show the reactions and their counts."""
+        try:
+            activity = get_last_fragment().getParentActivity()
+            rows = []
+            res = msg.messageOwner.reactions.results
+            for i in range(int(res.size())):
+                rc = res.get(i)
+                rows.append((self._reaction_text(rc.reaction), int(rc.count)))
+        except Exception:
+            self.logger.exception("counts dialog failed")
+            self._ui_info("Список реакций недоступен")
+            return
+        if activity is None or not rows:
+            return
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        text_color = Theme.getColor(Theme.key_dialogTextBlack)
+        hint_color = Theme.getColor(Theme.key_dialogTextGray2)
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(int(dp(20)), int(dp(8)), int(dp(20)), int(dp(8)))
+        for emoji, cnt in rows:
+            t = TextView(activity)
+            t.setText("%s   %d" % (emoji, cnt))
+            t.setTextSize(20.0)
+            t.setTextColor(text_color)
+            t.setPadding(0, int(dp(6)), 0, int(dp(6)))
+            root.addView(t)
+        note = TextView(activity)
+        note.setText("В каналах реакции анонимны: Telegram не отдаёт, кто их поставил." if anonymous
+                     else "Telegram не отдал список тех, кто поставил реакции.")
+        note.setTextSize(13.0)
+        note.setTextColor(hint_color)
+        note.setPadding(0, int(dp(12)), 0, 0)
+        root.addView(note)
+        total = sum(c for _, c in rows)
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Реакции · %d" % total)
+        builder.set_view(root)
+        builder.set_positive_button("Закрыть", lambda b, w: b.dismiss())
+        builder.show()
+
+    def _make_avatar_view(self, activity, obj, size_dp=34):
+        AvatarDrawable = jclass("org.telegram.ui.Components.AvatarDrawable")
+        ad = AvatarDrawable()
+        try:
+            ad.setInfo(obj)
+        except Exception:
+            pass
+        try:
+            BackupImageView = jclass("org.telegram.ui.Components.BackupImageView")
+            iv = BackupImageView(activity)
+            iv.setRoundRadius(int(dp(size_dp / 2.0)))
+            iv.setForUserOrChat(obj, ad)
+            return iv
+        except Exception:
+            iv = ImageView(activity)
+            ad.setBounds(0, 0, int(dp(size_dp)), int(dp(size_dp)))
+            iv.setImageDrawable(ad)
+            return iv
+
+    def _reactors_dialog(self, groups: Dict[str, list]):
+        try:
+            activity = get_last_fragment().getParentActivity()
+        except Exception:
+            activity = None
+        if activity is None:
+            return
+        if not groups:
+            BulletinHelper.show_info("Реакций пока нет")
+            return
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        text_color = Theme.getColor(Theme.key_dialogTextBlack)
+        hint_color = Theme.getColor(Theme.key_dialogTextGray2)
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(int(dp(20)), int(dp(4)), int(dp(20)), int(dp(8)))
+        for emoji, items in groups.items():
+            head = TextView(activity)
+            head.setText("%s  %d" % (emoji, len(items)))
+            head.setTextSize(17.0)
+            head.setTextColor(text_color)
+            head.setPadding(0, int(dp(10)), 0, int(dp(4)))
+            root.addView(head)
+            for kind, obj in items:
+                try:
+                    row = LinearLayout(activity)
+                    row.setOrientation(LinearLayout.HORIZONTAL)
+                    row.setGravity(16)
+                    row.setPadding(0, int(dp(4)), 0, int(dp(4)))
+                    row.addView(self._make_avatar_view(activity, obj),
+                                LinearLayout.LayoutParams(int(dp(34)), int(dp(34))))
+                    if kind == "u":
+                        name = (str(obj.first_name or "") + " " + str(obj.last_name or "")).strip()
+                        sub = ("@" + str(obj.username)) if obj.username else ""
+                    else:
+                        name = str(obj.title or "")
+                        sub = "канал"
+                    col = LinearLayout(activity)
+                    col.setOrientation(LinearLayout.VERTICAL)
+                    col.setPadding(int(dp(12)), 0, 0, 0)
+                    t1 = TextView(activity)
+                    t1.setText(name or "—")
+                    t1.setTextSize(16.0)
+                    t1.setTextColor(text_color)
+                    col.addView(t1)
+                    if sub:
+                        t2 = TextView(activity)
+                        t2.setText(sub)
+                        t2.setTextSize(13.0)
+                        t2.setTextColor(hint_color)
+                        col.addView(t2)
+                    row.addView(col)
+                    root.addView(row)
+                except Exception:
+                    self.logger.exception("reactor row failed")
+
+        scroll = ScrollView(activity)
+        scroll.addView(root)
+        total = sum(len(v) for v in groups.values())
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Реакции · %d" % total)
+        builder.set_view(scroll)
+        builder.set_positive_button("Закрыть", lambda b, w: b.dismiss())
+        builder.show()
